@@ -16,8 +16,8 @@ import grasp_policy
 gym = gymapi.acquire_gym()
 
 # default arguments
-custim_parameters = [{"name": "--num_envs", "type": int, "default": 256, "help": "Number of environments to create"}]
-args = gymutil.parse_arguments(custom_parameters=custim_parameters)
+custom_parameters = [{"name": "--num_envs", "type": int, "default": 256, "help": "Number of environments to create"}]
+args = gymutil.parse_arguments(custom_parameters=custom_parameters)
 # default: Namespace(compute_device_id=0, flex=False, graphics_device_id=0, num_threads=0, 
 #                    physics_engine=SimType.SIM_PHYSX, physx=False, pipeline='gpu', sim_device='cuda:0', 
 #                    sim_device_type='cuda', slices=0, subscenes=0, use_gpu=True, use_gpu_pipeline=True)
@@ -164,6 +164,10 @@ envs = list()
 frankas = list()
 cameras = list()
 cam_tensors_arr = list()
+franka_actor_idx = list()
+# rigid body (rb) indexes
+hand_rb_index = list()
+box_rb_index = list()
 
 print("Creating %d environments" % args.num_envs)
 for i in range(args.num_envs):
@@ -173,6 +177,8 @@ for i in range(args.num_envs):
   # add franka
   franka_handle = gym.create_actor(env, franka_asset, franka_pose, "franka", i, 1)
   frankas.append(franka_handle)
+  hand_rb_index.append(gym.find_actor_rigid_body_index(env, franka_handle, "panda_hand", gymapi.DOMAIN_SIM))
+  franka_actor_idx.append(gym.get_actor_index(env, franka_handle, gymapi.DOMAIN_SIM))
 
   # set dof props (the drives)
   gym.set_actor_dof_properties(env, franka_handle, franka_dof_props)
@@ -192,6 +198,7 @@ for i in range(args.num_envs):
   box_handle = gym.create_actor(env, box_asset, box_pose, "box", i, 0)
   color = gymapi.Vec3(*np.random.uniform(0, 1, 3))
   gym.set_rigid_body_color(env, box_handle, 0, gymapi.MESH_VISUAL_AND_COLLISION, color)
+  box_rb_index.append(gym.get_actor_rigid_body_index(env, box_handle, 0, gymapi.DOMAIN_SIM))
 
   # add camera
   camera_props = gymapi.CameraProperties()
@@ -212,26 +219,42 @@ for i in range(args.num_envs):
   torch_cam_tensor = torch_cam_tensor.unsqueeze(0)
   cam_tensors_arr.append(torch_cam_tensor)
 
-
 # prepare internal data structures for tensor API
 # otherwise get gym cuda error: an illegal memory access was encountered
 gym.prepare_sim(sim)
 
-# stack camera gpu tensors
-# cam_tensors = torch.stack(cam_tensors_arr) # stack seems to allocate new tensor
 # create policy network
 policyNet = grasp_policy.Policy().to(device=device)
 policyNet.eval()
 
-# collect dof tensors
+# collect dof tensors (frankas dof, other objects don't have dofs)
+franka_actor_idx = torch.tensor(franka_actor_idx)
 _dof_states = gym.acquire_dof_state_tensor(sim)
 dof_states = gymtorch.wrap_tensor(_dof_states)
-print(dof_states.shape)
+print("dof_states shape", dof_states.shape)
 dof_state_inpol = dof_states.view(args.num_envs, franka_num_dofs*2)
 dof_state_reset = dof_states.view(args.num_envs, franka_num_dofs, 2)
 
+# collect rb tensor for reward calculations later
+_rb_states = gym.acquire_rigid_body_state_tensor(sim)
+rb_states = gymtorch.wrap_tensor(_rb_states)
+print("rb_states shape", rb_states.shape)
+
+# sim params
+steps_train = 50
+episode_secs = 20
+
+# storage tensors
+# img_obs = torch.zeros(args.num_envs, )
+# dof_obs
+# acts
+# acts_probs
+# vals
+# rewards
+# terms
 
 print("dof indexes", [gym.get_actor_dof_index(envs[0], frankas[0], i, gymapi.DOMAIN_SIM) for i in range(9)])
+print("num actors", gym.get_sim_actor_count(sim))
 
 frame_wait = 50
 while not gym.query_viewer_has_closed(viewer):
@@ -241,6 +264,9 @@ while not gym.query_viewer_has_closed(viewer):
   gym.fetch_results(sim, True)
 
   gym.refresh_dof_state_tensor(sim)
+  gym.refresh_rigid_body_state_tensor(sim)
+
+  
 
   cam_cap = False
   for evt in gym.query_viewer_action_events(viewer):
@@ -262,9 +288,8 @@ while not gym.query_viewer_has_closed(viewer):
 
   gym.end_access_image_tensors(sim)
 
-  if cam_cap: cam_fails = torch.tensor([0])
+  if cam_cap: cam_fails = torch.tensor([4,7,24])
 
-  # dof_targets = torch.zeros(args.num_envs, franka_num_dofs, device=device)
   dof_targets[cam_fails] = default_dof_pos_tensor
   gym.set_dof_position_target_tensor(sim, gymtorch.unwrap_tensor(dof_targets))
 
@@ -273,11 +298,9 @@ while not gym.query_viewer_has_closed(viewer):
     new_dof_state = torch.zeros_like(dof_state_reset)
     new_dof_state[cam_fails, :, 0] = default_dof_pos_tensor
     new_dof_state = new_dof_state.view(args.num_envs * franka_num_dofs, 2)
-    indices = [torch.arange(idx*franka_num_dofs, (idx+1)*franka_num_dofs) for idx in cam_fails]
-    indices = torch.stack(indices).flatten().to(device=device, dtype=torch.int32)
-    print(indices)
-    # print(new_dof_state)
-    gym.set_dof_state_tensor_indexed(sim, gymtorch.unwrap_tensor(new_dof_state), gymtorch.unwrap_tensor(indices), 1)
+    franka_fails = franka_actor_idx[cam_fails]
+    franka_fails_int32 = franka_fails.to(device=device, dtype=torch.int32)
+    gym.set_dof_state_tensor_indexed(sim, gymtorch.unwrap_tensor(new_dof_state), gymtorch.unwrap_tensor(franka_fails_int32), len(franka_fails_int32))
 
 
   # draw viewer
