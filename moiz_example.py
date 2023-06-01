@@ -1,11 +1,15 @@
 
 from isaacgym import gymapi
 from isaacgym import gymutil
+from isaacgym import gymtorch
 from isaacgym import torch_utils
 
+import torch
 import numpy as np
 
 import math
+
+import grasp_policy
 
 
 # get access to gymapi interface
@@ -159,6 +163,7 @@ env_upper = gymapi.Vec3(spacing, spacing, spacing)
 envs = list()
 frankas = list()
 cameras = list()
+cam_tensors_arr = list()
 
 print("Creating %d environments" % args.num_envs)
 for i in range(args.num_envs):
@@ -201,31 +206,79 @@ for i in range(args.num_envs):
   gym.attach_camera_to_body(camera_handle, env, body_handle, local_transform, gymapi.FOLLOW_TRANSFORM)
   cameras.append(camera_handle)
 
+  # get camera tensor
+  cam_tensor = gym.get_camera_image_gpu_tensor(sim, env, camera_handle, gymapi.IMAGE_DEPTH)
+  torch_cam_tensor = gymtorch.wrap_tensor(cam_tensor)
+  torch_cam_tensor = torch_cam_tensor.unsqueeze(0)
+  cam_tensors_arr.append(torch_cam_tensor)
+
 
 # prepare internal data structures for tensor API
 # otherwise get gym cuda error: an illegal memory access was encountered
 gym.prepare_sim(sim)
 
+# stack camera gpu tensors
+# cam_tensors = torch.stack(cam_tensors_arr) # stack seems to allocate new tensor
+# create policy network
+policyNet = grasp_policy.Policy().to(device=device)
+policyNet.eval()
+
+# collect dof tensors
+_dof_states = gym.acquire_dof_state_tensor(sim)
+dof_states = gymtorch.wrap_tensor(_dof_states)
+print(dof_states.shape)
+dof_state_inpol = dof_states.view(args.num_envs, franka_num_dofs*2)
+dof_state_reset = dof_states.view(args.num_envs, franka_num_dofs, 2)
+
+
+print("dof indexes", [gym.get_actor_dof_index(envs[0], frankas[0], i, gymapi.DOMAIN_SIM) for i in range(9)])
+
+frame_wait = 50
 while not gym.query_viewer_has_closed(viewer):
+  frame_no = gym.get_frame_count(sim)
   # step the physics
   gym.simulate(sim)
   gym.fetch_results(sim, True)
 
+  gym.refresh_dof_state_tensor(sim)
+
   cam_cap = False
   for evt in gym.query_viewer_action_events(viewer):
-    if evt.action == "cam_cap":
+    if evt.action == "cam_cap" and evt.value > 0:
       cam_cap = True
 
   # update viewer
   gym.step_graphics(sim)
+  # render sensors and refresh camera tensors
   gym.render_all_camera_sensors(sim)
-
   gym.start_access_image_tensors(sim)
 
-  if cam_cap:
-    gym.write_camera_image_to_file(sim, envs[0], cameras[0], gymapi.IMAGE_DEPTH, "depth_image.png")
+  cam_tensors = torch.stack(cam_tensors_arr)
+  cam_fails = torch.unique(torch.nonzero(torch.isinf(cam_tensors))[:, 0])
+  cam_tensors[cam_fails] = torch.zeros(len(cam_fails), 1, 128, 128).to(device=device)
 
-  gym.end_access_image_tensors(sim) 
+  with torch.no_grad():
+    dof_targets, _, _ = policyNet.get_action_value(cam_tensors, dof_state_inpol)  
+
+  gym.end_access_image_tensors(sim)
+
+  if cam_cap: cam_fails = torch.tensor([0])
+
+  # dof_targets = torch.zeros(args.num_envs, franka_num_dofs, device=device)
+  dof_targets[cam_fails] = default_dof_pos_tensor
+  gym.set_dof_position_target_tensor(sim, gymtorch.unwrap_tensor(dof_targets))
+
+  if cam_fails.numel() != 0:
+    print("resetting", cam_fails, "on frame", frame_no)
+    new_dof_state = torch.zeros_like(dof_state_reset)
+    new_dof_state[cam_fails, :, 0] = default_dof_pos_tensor
+    new_dof_state = new_dof_state.view(args.num_envs * franka_num_dofs, 2)
+    indices = [torch.arange(idx*franka_num_dofs, (idx+1)*franka_num_dofs) for idx in cam_fails]
+    indices = torch.stack(indices).flatten().to(device=device, dtype=torch.int32)
+    print(indices)
+    # print(new_dof_state)
+    gym.set_dof_state_tensor_indexed(sim, gymtorch.unwrap_tensor(new_dof_state), gymtorch.unwrap_tensor(indices), 1)
+
 
   # draw viewer
   gym.draw_viewer(viewer, sim, True)
