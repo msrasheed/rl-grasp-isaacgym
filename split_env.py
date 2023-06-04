@@ -5,11 +5,18 @@ from isaacgym import gymtorch
 from isaacgym import torch_utils
 
 import torch
+import torch.optim as optim
+import torch.nn as nn
+from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 
 import math
+import time
 
 import grasp_policy
+import igenv
+import running_mean_std as rms
+import util
 
 
 # get access to gymapi interface
@@ -168,6 +175,8 @@ franka_actor_idx = list()
 # rigid body (rb) indexes
 hand_rb_index = list()
 box_rb_index = list()
+# root rigid body collect
+root_body_init = list()
 
 print("Creating %d environments" % num_envs)
 for i in range(num_envs):
@@ -179,6 +188,7 @@ for i in range(num_envs):
   frankas.append(franka_handle)
   hand_rb_index.append(gym.find_actor_rigid_body_index(env, franka_handle, "panda_hand", gymapi.DOMAIN_SIM))
   franka_actor_idx.append(gym.get_actor_index(env, franka_handle, gymapi.DOMAIN_SIM))
+  root_body_init.append(util.transform_to_rb_tensor(franka_pose))
 
   # set dof props (the drives)
   gym.set_actor_dof_properties(env, franka_handle, franka_dof_props)
@@ -189,6 +199,7 @@ for i in range(num_envs):
 
   # add table
   table_handle = gym.create_actor(env, table_asset, table_pose, "table", i, 0)
+  root_body_init.append(util.transform_to_rb_tensor(table_pose))
 
   # add box - random position/rotation on table
   box_pose.p.x = table_pose.p.x # + np.random.uniform(-0.2, 0.1)
@@ -199,6 +210,7 @@ for i in range(num_envs):
   color = gymapi.Vec3(*np.random.uniform(0, 1, 3))
   gym.set_rigid_body_color(env, box_handle, 0, gymapi.MESH_VISUAL_AND_COLLISION, color)
   box_rb_index.append(gym.get_actor_rigid_body_index(env, box_handle, 0, gymapi.DOMAIN_SIM))
+  root_body_init.append(util.transform_to_rb_tensor(box_pose))
 
   # add camera
   camera_props = gymapi.CameraProperties()
@@ -225,7 +237,10 @@ gym.prepare_sim(sim)
 
 # create policy network
 policyNet = grasp_policy.Policy().to(device=device)
-policyNet.eval()
+optimizer = optim.Adam(policyNet.parameters(), lr=3e-4)
+
+# tensorboard logger
+writer = SummaryWriter()
 
 # collect dof tensors (frankas dof, other objects don't have dofs)
 franka_actor_idx = torch.tensor(franka_actor_idx)
@@ -240,73 +255,202 @@ _rb_states = gym.acquire_rigid_body_state_tensor(sim)
 rb_states = gymtorch.wrap_tensor(_rb_states)
 print("rb_states shape", rb_states.shape)
 
+# collect root state tensor for resets
+_root_tensor = gym.acquire_actor_root_state_tensor(sim)
+root_tensor = gymtorch.wrap_tensor(_root_tensor)
+
+
+# setup reset vals
+reset_dof_state_tensor = torch.zeros_like(dof_state_reset)
+reset_dof_state_tensor[:, :, 0] = default_dof_pos_tensor
+reset_dof_target_tensor = reset_dof_state_tensor[:, :, 0].clone()
+reset_root_body_tensor = torch.stack(root_body_init).to(device)
+
 # sim params
+num_frames_sec = 60
 steps_train = 50
 episode_secs = 20
+num_episodes = 1000
+assert ((episode_secs * num_frames_sec) % steps_train) == 0, "episode num frames not divisible by num train frames"
 
-# storage tensors
-img_obs = torch.zeros(steps_train, num_envs, 1, 128, 128)
-dof_obs = torch.zeros(steps_train, num_envs, franka_num_dofs*2)
-acts = torch.zeros(steps_train, num_envs, franka_num_dofs)
-acts_probs = torch.zeros(steps_train, num_envs, franka_num_dofs)
-vals = torch.zeros(steps_train, num_envs)
-rewards = torch.zeros(steps_train, num_envs)
-terms = torch.zeros(steps_train, num_envs)
+target_height = table_dims.z + .2
 
-print("dof indexes", [gym.get_actor_dof_index(envs[0], frankas[0], i, gymapi.DOMAIN_SIM) for i in range(9)])
+gae_gamma = 0.99
+gae_lambda = 0.95
+epochs = 3
+minibatch_size = 1000
+clip_coef = 0.2
+ent_coef = .01
+vf_coef = 0.5
+max_grad_norm = .5
+
+
 print("num actors", gym.get_sim_actor_count(sim))
 
-while not gym.query_viewer_has_closed(viewer):
-  frame_no = gym.get_frame_count(sim)
-  # step the physics
-  gym.simulate(sim)
-  gym.fetch_results(sim, True)
+env = igenv.IsaacGymEnv(gym, sim, device, franka_actor_idx, franka_num_dofs)
 
-  gym.refresh_dof_state_tensor(sim)
-  gym.refresh_rigid_body_state_tensor(sim)
+# storage tensors
+img_obs = torch.zeros(steps_train, num_envs, 1, 128, 128).to(device=device)
+dof_obs = torch.zeros(steps_train, num_envs, franka_num_dofs*2).to(device=device)
+acts = torch.zeros(steps_train, num_envs, franka_num_dofs).to(device=device)
+acts_probs = torch.zeros(steps_train, num_envs).to(device=device)
+vals = torch.zeros(steps_train+1, num_envs).to(device=device)
+rewards = torch.zeros(steps_train, num_envs).to(device=device)
+terms = torch.zeros(steps_train, num_envs).to(device=device)
 
-  cam_cap = False
-  for evt in gym.query_viewer_action_events(viewer):
-    if evt.action == "cam_cap" and evt.value > 0:
-      cam_cap = True
-
-  # update viewer
-  gym.step_graphics(sim)
-  # render sensors and refresh camera tensors
-  gym.render_all_camera_sensors(sim)
-  gym.start_access_image_tensors(sim)
-
-  cam_tensors = torch.stack(cam_tensors_arr)
-  cam_fails = torch.unique(torch.nonzero(torch.isinf(cam_tensors))[:, 0])
-  # cam_tensors[cam_fails] = torch.zeros(len(cam_fails), 1, 128, 128).to(device=device)
-
-  # with torch.no_grad():
-    # dof_targets, _, _ = policyNet.get_action_value(cam_tensors, dof_state_inpol)  
-
-  gym.end_access_image_tensors(sim)
-
-  if cam_cap: cam_fails = torch.tensor([4,7,24])
-
-  # dof_targets[cam_fails] = default_dof_pos_tensor
-  # gym.set_dof_position_target_tensor(sim, gymtorch.unwrap_tensor(dof_targets))
-
-  if cam_fails.numel() != 0:
-    # print("resetting", cam_fails, "on frame", frame_no)
-    # new_dof_state = torch.zeros_like(dof_state_reset)
-    # new_dof_state[cam_fails, :, 0] = default_dof_pos_tensor
-    # new_dof_state = new_dof_state.view(num_envs * franka_num_dofs, 2)
-    # franka_fails = franka_actor_idx[cam_fails]
-    # franka_fails_int32 = franka_fails.to(device=device, dtype=torch.int32)
-    # gym.set_dof_state_tensor_indexed(sim, gymtorch.unwrap_tensor(new_dof_state), gymtorch.unwrap_tensor(franka_fails_int32), len(franka_fails_int32))
-
-    hand_dist = torch.norm(rb_states[box_rb_index, 0:3]-rb_states[hand_rb_index, 0:3], dim=1)
-    print("dists", hand_dist)
+img_obs_rms = rms.RunningMeanStd(img_obs.shape[2:], device)
+dof_obs_rms = rms.RunningMeanStd(dof_obs.shape[2:], device)
+ret_rms = rms.RunningMeanStd(device=device)
 
 
-  # draw viewer
-  gym.draw_viewer(viewer, sim, True)
-  # wait for dt to elapse in real time
-  gym.sync_frame_time(sim)
+global_step = 0
+start_time = time.time()
+
+for episode in range(num_episodes):
+
+  env.reset(reset_dof_target_tensor, reset_dof_state_tensor, reset_root_body_tensor)
+
+  for train_step in range((episode_secs * num_frames_sec) // steps_train):
+
+    policyNet.eval()
+    with torch.no_grad():
+      i = 0
+      while i < steps_train and not gym.query_viewer_has_closed(viewer):
+        frame_no = gym.get_frame_count(sim)
+        global_step += 1 * num_envs
+
+        # see what cameras are failing
+        env.start_cam_access()
+        cam_tensors = torch.stack(cam_tensors_arr)
+        cam_fails = torch.unique(torch.nonzero(torch.isinf(cam_tensors))[:, 0])
+        cam_tensors[cam_fails] = torch.zeros(len(cam_fails), 1, 128, 128).to(device=device)
+        env.end_cam_access()
+
+        img_obs_rms.update(cam_tensors)
+        norm_cam_tensors = img_obs_rms.normalize(cam_tensors)
+        dof_obs_rms.update(dof_state_inpol)
+        norm_dof_states = dof_obs_rms.normalize(dof_state_inpol)
+
+        # cam penalty
+        terms[i-1, cam_fails] = True
+        rewards[i-1, cam_fails] -= 1
+
+        # compute action
+        dof_targets, target_logprobs, values = policyNet.get_action_value(norm_cam_tensors, norm_dof_states)  
+
+        # step environment
+        env.step(dof_targets, torch.nonzero(terms[i-1]))
+
+        # calc rewards
+        hand_dist = torch.norm(rb_states[box_rb_index, 0:3]-rb_states[hand_rb_index, 0:3], dim=1)
+        box_height = target_height - rb_states[box_rb_index, 2] 
+        finished = box_height > target_height
+
+        img_obs[i] = norm_cam_tensors
+        dof_obs[i] = norm_dof_states
+        acts[i] = dof_targets
+        acts_probs[i] = target_logprobs.flatten()
+        vals[i] = values.flatten()
+        rewards[i] = -(hand_dist + box_height)
+        terms[i] = finished
+
+        # draw viewer
+        gym.draw_viewer(viewer, sim, True)
+        # wait for dt to elapse in real time
+        gym.sync_frame_time(sim)
+
+        i += 1
+
+      # next values for bootstrapping
+      env.start_cam_access()
+      cam_tensors = torch.stack(cam_tensors_arr)
+      cam_fails = torch.unique(torch.nonzero(torch.isinf(cam_tensors))[:, 0])
+      cam_tensors[cam_fails] = torch.zeros(len(cam_fails), 1, 128, 128).to(device=device)
+      env.end_cam_access()
+      norm_cam_tensors = img_obs_rms.normalize(cam_tensors)
+      norm_dof_states = dof_obs_rms.normalize(dof_state_inpol)
+      _, _, values = policyNet.get_action_value(norm_cam_tensors, norm_dof_states)
+      vals[i] = values.flatten()
+      vals[i, cam_fails] = 0
+      terms[i-1, cam_fails] = True
+      rewards[i-1, cam_fails] -= 1
+
+      # calculate advantages
+      advantages = torch.zeros_like(vals)
+      for t in reversed(range(steps_train)):
+        delta = rewards[t] + gae_gamma*terms[t]*vals[t+1] - vals[t]
+        advantages[t] = delta + gae_gamma*gae_lambda*terms[t]*advantages[t+1]
+    
+      advantages = advantages[:steps_train]
+      values = vals[:steps_train]
+      returns = advantages + values
+
+    # flatten the batch
+    b_img_obs = img_obs.reshape(-1, *img_obs.shape[2:])
+    b_dof_obs = dof_obs.reshape(-1, *dof_obs.shape[2:])
+    b_acts = acts.reshape(-1, *acts.shape[2:])
+    b_acts_probs = acts_probs.reshape(-1, *acts_probs.shape[2:])
+    b_vals = values.flatten()
+    b_returns = returns.flatten()
+    b_terms = terms.flatten()
+    b_advantages = advantages.flatten()
+
+    policyNet.train()
+
+    b_inds = np.arange(b_terms.numel())
+    clipfracs = []
+    for epoch in range(epochs):
+      np.random.shuffle(b_inds) # in-place
+      for start in range(0, b_terms.numel(), minibatch_size):
+        end = start + minibatch_size
+        mb_inds = b_inds[start:end]
+
+        newactprob, entropy, newvalue = policyNet(b_img_obs[mb_inds], b_dof_obs[mb_inds], b_acts[mb_inds])
+        logratio = newactprob - b_acts_probs[mb_inds]
+        ratio = logratio.exp()
+
+        with torch.no_grad():
+          old_approx_kl = (-logratio).mean()
+          approx_kl = ((ratio-1) - logratio).mean()
+          clipfracs += [((ratio-1.0).abs() > clip_coef).float().mean().item()]
+
+        mb_advantages = (-b_advantages[mb_inds])
+        pg_loss1 = mb_advantages * ratio
+        pg_loss2 = mb_advantages * torch.clamp(ratio, 1-clip_coef, 1+clip_coef)
+        pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+        # no clipping
+        v_loss = 0.5 * torch.pow(newvalue - b_returns[mb_inds], 2).mean()
+
+        entropy_loss = entropy.mean()
+        loss = pg_loss - ent_coef*entropy_loss + vf_coef*v_loss
+
+        optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(policyNet.parameters(), max_grad_norm)
+        optimizer.step()
+
+    y_pred = b_vals.cpu().numpy()
+    y_true = b_returns.cpu().numpy()
+    var_y = np.var(y_true)
+    explained_var = np.nan if var_y == 0 else 1 - np.var(y_true-y_pred) / var_y
+    
+    writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+    writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
+    writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
+    writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
+    writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
+    writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
+    writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
+    writer.add_scalar("losses/explained_variance", explained_var, global_step)
+    print("SPS:", int(global_step / (time.time() - start_time)))
+    writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+    if gym.query_viewer_has_closed(viewer):
+      break
+
+  if gym.query_viewer_has_closed(viewer):
+    break
 
 gym.destroy_viewer(viewer)
 gym.destroy_sim(sim)
