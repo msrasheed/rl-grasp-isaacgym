@@ -9,9 +9,12 @@ import torch.optim as optim
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
+import tqdm
 
+import os
 import math
 import time
+import signal
 
 import grasp_policy
 import igenv
@@ -254,8 +257,6 @@ gym.prepare_sim(sim)
 policyNet = grasp_policy.Policy().to(device=device)
 optimizer = optim.Adam(policyNet.parameters(), lr=3e-4)
 
-# tensorboard logger
-writer = SummaryWriter()
 
 # collect dof tensors (frankas dof, other objects don't have dofs)
 franka_actor_idx = torch.tensor(franka_actor_idx)
@@ -295,7 +296,7 @@ gae_lambda = 0.95
 epochs = 3
 minibatch_size = 1000
 clip_coef = 0.2
-ent_coef = .01
+ent_coef = 0
 vf_coef = 0.5
 max_grad_norm = .5
 
@@ -325,10 +326,26 @@ env = igenv.NormalizeWrapper(raw_env,
                                          dof_obs.shape[2:]],
                              gamma=gae_gamma)
 
+# tensorboard logger
+writer = SummaryWriter()
+def save_actor(name_prefix):
+  path_name = os.path.join(writer.log_dir, name_prefix)
+  torch.save(policyNet.state_dict(), path_name + ".pth")
+  env.save_obs_tensors(path_name)
+  
+if args.no_visual:
+  def sigint_handler(sig, frame):
+    save_actor("end")
+    gym.destroy_sim(sim)
+    exit()
+  signal.signal(signal.SIGINT, sigint_handler)
+
+
 global_step = 0
 start_time = time.time()
+max_return = float('-inf')
 
-for episode in range(num_episodes):
+for episode in tqdm.tqdm(range(num_episodes)):
 
   obs = env.reset(reset_dof_target_tensor, reset_dof_state_tensor, reset_root_body_tensor)
   num_terms = 0
@@ -350,7 +367,7 @@ for episode in range(num_episodes):
 
         # step environment
         next_obs, rewds, terms, truncs = env.step(dof_targets)
-        print(rewds)
+        # print(rewds)
 
         img_obs[i] = cam_tensors
         dof_obs[i] = dof_states
@@ -451,14 +468,22 @@ for episode in range(num_episodes):
     writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
     writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
     writer.add_scalar("losses/explained_variance", explained_var, global_step)
-    print("SPS:", int(global_step / (time.time() - start_time)))
+    # print("SPS:", int(global_step / (time.time() - start_time)))
     writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+
+    writer.add_scalar("diagnostic/value_mean", b_vals.mean().item(), global_step)
+    writer.add_scalar("diagnostic/return_mean", b_returns.mean().item(), global_step)
 
   writer.add_scalar("progress/num_terms", num_terms.item(), global_step)
   writer.add_scalar("progress/tot_returns", tot_returns.item(), global_step)
 
+  if tot_returns.item() > max_return:
+    save_actor("max")
+
   if check_viewer_closed():
     break
+
+save_actor("end")
 
 if not args.no_visual:
   gym.destroy_viewer(viewer)

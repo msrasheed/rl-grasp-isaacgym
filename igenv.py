@@ -154,3 +154,14 @@ class NormalizeWrapper:
     self.ret[self.prev_reset] = 0
     self.prev_reset = torch.logical_or(terms, truncs)
     return normobs, normrwds, terms, truncs
+
+  def save_obs_tensors(self, prefix):
+    for i, r in enumerate(self.obs_rms):
+      torch.save(r.mean, prefix + f"_mean_{i}.tensor")
+      torch.save(r.var, prefix + f"_var_{i}.tensor")
+
+  def load_obs_tensors(self, prefix):
+    for i, r in enumerate(self.obs_rms):
+      r.mean = torch.load(prefix + f"_mean_{i}.tensor")
+      r.var = torch.load(prefix + f"_var_{i}.tensor")
+    
