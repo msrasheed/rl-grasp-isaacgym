@@ -172,6 +172,7 @@ frankas = list()
 cameras = list()
 cam_tensors_arr = list()
 franka_actor_idx = list()
+box_actor_idx = list()
 # rigid body (rb) indexes
 hand_rb_index = list()
 box_rb_index = list()
@@ -210,6 +211,7 @@ for i in range(num_envs):
   color = gymapi.Vec3(*np.random.uniform(0, 1, 3))
   gym.set_rigid_body_color(env, box_handle, 0, gymapi.MESH_VISUAL_AND_COLLISION, color)
   box_rb_index.append(gym.get_actor_rigid_body_index(env, box_handle, 0, gymapi.DOMAIN_SIM))
+  box_actor_idx.append(gym.get_actor_index(env, box_handle, gymapi.DOMAIN_SIM))
   root_body_init.append(util.transform_to_rb_tensor(box_pose))
 
   # add camera
@@ -287,7 +289,17 @@ max_grad_norm = .5
 
 print("num actors", gym.get_sim_actor_count(sim))
 
-env = igenv.IsaacGymEnv(gym, sim, device, franka_actor_idx, franka_num_dofs)
+env = igenv.IsaacGymEnv(gym, sim, 
+                        franka_num_dofs=franka_num_dofs,
+                        target_height=target_height,
+                        device=device, 
+                        env_to_box=torch.tensor(box_actor_idx),
+                        env_to_franka=franka_actor_idx,
+                        box_rb_idx=box_rb_index,
+                        hand_rb_idx=hand_rb_index,
+                        dof_state_tensor=dof_state_inpol,
+                        cam_tensors_arr=cam_tensors_arr,
+                        rb_states=rb_states)
 
 # storage tensors
 img_obs = torch.zeros(steps_train, num_envs, 1, 128, 128).to(device=device)
@@ -308,7 +320,7 @@ start_time = time.time()
 
 for episode in range(num_episodes):
 
-  env.reset(reset_dof_target_tensor, reset_dof_state_tensor, reset_root_body_tensor)
+  obs = env.reset(reset_dof_target_tensor, reset_dof_state_tensor, reset_root_body_tensor)
 
   for train_step in range((episode_secs * num_frames_sec) // steps_train):
 
@@ -319,40 +331,27 @@ for episode in range(num_episodes):
         frame_no = gym.get_frame_count(sim)
         global_step += 1 * num_envs
 
-        # see what cameras are failing
-        env.start_cam_access()
-        cam_tensors = torch.stack(cam_tensors_arr)
-        cam_fails = torch.unique(torch.nonzero(torch.isinf(cam_tensors))[:, 0])
-        cam_tensors[cam_fails] = torch.zeros(len(cam_fails), 1, 128, 128).to(device=device)
-        env.end_cam_access()
+        cam_tensors, dof_states_inpol = obs
 
         img_obs_rms.update(cam_tensors)
         norm_cam_tensors = img_obs_rms.normalize(cam_tensors)
         dof_obs_rms.update(dof_state_inpol)
         norm_dof_states = dof_obs_rms.normalize(dof_state_inpol)
 
-        # cam penalty
-        terms[i-1, cam_fails] = True
-        rewards[i-1, cam_fails] -= 1
-
         # compute action
         dof_targets, target_logprobs, values = policyNet.get_action_value(norm_cam_tensors, norm_dof_states)  
 
         # step environment
-        env.step(dof_targets, torch.nonzero(terms[i-1]))
-
-        # calc rewards
-        hand_dist = torch.norm(rb_states[box_rb_index, 0:3]-rb_states[hand_rb_index, 0:3], dim=1)
-        box_height = target_height - rb_states[box_rb_index, 2] 
-        finished = box_height > target_height
+        next_obs, rewds, last_step = env.step(dof_targets)
+        print(rewds)
 
         img_obs[i] = norm_cam_tensors
         dof_obs[i] = norm_dof_states
         acts[i] = dof_targets
         acts_probs[i] = target_logprobs.flatten()
         vals[i] = values.flatten()
-        rewards[i] = -(hand_dist + box_height)
-        terms[i] = finished
+        rewards[i] = rewds
+        terms[i] = last_step
 
         # draw viewer
         gym.draw_viewer(viewer, sim, True)
@@ -360,26 +359,21 @@ for episode in range(num_episodes):
         gym.sync_frame_time(sim)
 
         i += 1
+        obs = next_obs
 
       # next values for bootstrapping
-      env.start_cam_access()
-      cam_tensors = torch.stack(cam_tensors_arr)
-      cam_fails = torch.unique(torch.nonzero(torch.isinf(cam_tensors))[:, 0])
-      cam_tensors[cam_fails] = torch.zeros(len(cam_fails), 1, 128, 128).to(device=device)
-      env.end_cam_access()
+      cam_tensors, dof_states_inpol = obs
       norm_cam_tensors = img_obs_rms.normalize(cam_tensors)
       norm_dof_states = dof_obs_rms.normalize(dof_state_inpol)
       _, _, values = policyNet.get_action_value(norm_cam_tensors, norm_dof_states)
       vals[i] = values.flatten()
-      vals[i, cam_fails] = 0
-      terms[i-1, cam_fails] = True
-      rewards[i-1, cam_fails] -= 1
 
       # calculate advantages
+      not_last_step = 1 - terms
       advantages = torch.zeros_like(vals)
       for t in reversed(range(steps_train)):
-        delta = rewards[t] + gae_gamma*terms[t]*vals[t+1] - vals[t]
-        advantages[t] = delta + gae_gamma*gae_lambda*terms[t]*advantages[t+1]
+        delta = rewards[t] + gae_gamma*not_last_step[t]*vals[t+1] - vals[t]
+        advantages[t] = delta + gae_gamma*gae_lambda*not_last_step[t]*advantages[t+1]
     
       advantages = advantages[:steps_train]
       values = vals[:steps_train]
