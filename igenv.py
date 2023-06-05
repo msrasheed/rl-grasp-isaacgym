@@ -38,7 +38,8 @@ class IsaacGymEnv:
       self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(root_body_tensor))
     else: self.first_reset_called = True
 
-    self.env_reset = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+    self.terms = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+    self.truncs = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
     self.rewards = torch.zeros(self.num_envs, device=self.device)
     self._step()
     cam_obs = self.get_cam_obs()
@@ -62,19 +63,19 @@ class IsaacGymEnv:
   def step(self, dof_targets):
     self.rewards = torch.zeros(self.num_envs, device=self.device)
 
-    terms = torch.nonzero(self.env_reset)
-    if terms.numel() != 0:
-      print("resetting", terms)
+    reset_envs = torch.nonzero(torch.logical_or(self.terms, self.truncs))
+    if reset_envs.numel() != 0:
+      print("resetting", reset_envs)
 
-    dof_targets[terms] = self.reset_dof_target[terms]
+    dof_targets[reset_envs] = self.reset_dof_target[reset_envs]
     self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(dof_targets))
 
-    if terms.numel() != 0:
-      franka_fails = self.env_to_franka[terms]
+    if reset_envs.numel() != 0:
+      franka_fails = self.env_to_franka[reset_envs]
       franka_fails_int32 = franka_fails.to(device=self.device, dtype=torch.int32)
       self.gym.set_dof_state_tensor_indexed(self.sim, gymtorch.unwrap_tensor(self.reset_dof_state), gymtorch.unwrap_tensor(franka_fails_int32), len(franka_fails_int32))
 
-      box_fails = self.env_to_box[terms]
+      box_fails = self.env_to_box[reset_envs]
       box_fails_int32 = box_fails.to(device=self.device, dtype=torch.int32)
       box_franka_idx = torch.cat((franka_fails_int32, box_fails_int32))
       self.gym.set_actor_root_state_tensor_indexed(self.sim, gymtorch.unwrap_tensor(self.reset_root_body), gymtorch.unwrap_tensor(box_franka_idx), len(box_franka_idx))
@@ -83,10 +84,12 @@ class IsaacGymEnv:
     cam_obs = self.get_cam_obs()
     self.calc_results()
 
-    ret_env_reset = self.env_reset
-    self.env_reset = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+    ret_terms = self.terms
+    ret_truncs = self.truncs
+    self.terms = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+    self.truncs = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
 
-    return (cam_obs, self.dof_state_tensor), self.rewards, ret_env_reset
+    return (cam_obs, self.dof_state_tensor), self.rewards, ret_terms, ret_truncs
 
 
   def start_cam_access(self):
@@ -114,7 +117,7 @@ class IsaacGymEnv:
     box_height = self.target_height - self.rb_states[self.box_rb_idx, 2] 
     finished = box_height > self.target_height
 
-    self.env_reset |= finished
+    self.terms |= finished
 
     self.rewards = -(hand_dist + box_height)
 
@@ -141,7 +144,7 @@ class NormalizeWrapper:
     return [r.normalize(ob) for r, ob in zip(self.obs_rms, obs)]
 
   def step(self, dof_targets):
-    obs, rewds, last_step = self.venv.step(dof_targets)
+    obs, rewds, terms, truncs = self.venv.step(dof_targets)
     normobs = self._obfilt(obs)
     self.ret = self.ret * self.gamma + rewds
     self.rwd_rms.update(self.ret)
@@ -149,5 +152,5 @@ class NormalizeWrapper:
     normrwds = self.rwd_rms.normalize_no_center(rewds)
     # normrwds = rewds
     self.ret[self.prev_reset] = 0
-    self.prev_reset = last_step
-    return normobs, normrwds, last_step
+    self.prev_reset = torch.logical_or(terms, truncs)
+    return normobs, normrwds, terms, truncs

@@ -23,7 +23,11 @@ import util
 gym = gymapi.acquire_gym()
 
 # default arguments
-custom_parameters = [{"name": "--num_envs", "type": int, "default": 256, "help": "Number of environments to create"}]
+custom_parameters = [
+  {"name": "--num_envs", "type": int, "default": 256, "help": "Number of environments to create"},
+  {"name": "--no_visual", "action": "store_true", "help": "Whether to render display or not"}
+  ]
+
 args = gymutil.parse_arguments(custom_parameters=custom_parameters)
 # default: Namespace(compute_device_id=0, flex=False, graphics_device_id=0, num_threads=0, 
 #                    physics_engine=SimType.SIM_PHYSX, physx=False, pipeline='gpu', sim_device='cuda:0', 
@@ -87,11 +91,20 @@ sim_params = get_sim_params(args)
 sim = gym.create_sim(args.compute_device_id, args.graphics_device_id, args.physics_engine, sim_params)
 
 # create viewer
-cam_props = gymapi.CameraProperties()
-viewer = gym.create_viewer(sim, cam_props)
+if not args.no_visual:
+  cam_props = gymapi.CameraProperties()
+  viewer = gym.create_viewer(sim, cam_props)
 
-# subscribe to input events
-gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_SPACE, "cam_cap")
+  # subscribe to input events
+  gym.subscribe_viewer_keyboard_event(viewer, gymapi.KEY_SPACE, "cam_cap")
+  
+  def check_viewer_closed():
+    return gym.query_viewer_has_closed(viewer)
+  
+else:
+  def check_viewer_closed():
+    return False
+
 
 # Creating Ground Plane
 plane_params = gymapi.PlaneParams()
@@ -269,10 +282,10 @@ reset_dof_target_tensor = reset_dof_state_tensor[:, :, 0].clone()
 reset_root_body_tensor = torch.stack(root_body_init).to(device)
 
 # sim params
-num_frames_sec = 60
+num_episodes = 1000
 steps_train = 50
 episode_secs = 20
-num_episodes = 1000
+num_frames_sec = 60
 assert ((episode_secs * num_frames_sec) % steps_train) == 0, "episode num frames not divisible by num train frames"
 
 target_height = table_dims.z + .2
@@ -285,9 +298,6 @@ clip_coef = 0.2
 ent_coef = .01
 vf_coef = 0.5
 max_grad_norm = .5
-
-
-print("num actors", gym.get_sim_actor_count(sim))
 
 raw_env = igenv.IsaacGymEnv(gym, sim, 
                         franka_num_dofs=franka_num_dofs,
@@ -308,7 +318,7 @@ acts = torch.zeros(steps_train, num_envs, franka_num_dofs).to(device=device)
 acts_probs = torch.zeros(steps_train, num_envs).to(device=device)
 vals = torch.zeros(steps_train+1, num_envs).to(device=device)
 rewards = torch.zeros(steps_train, num_envs).to(device=device)
-terms = torch.zeros(steps_train, num_envs).to(device=device)
+dones = torch.zeros(steps_train, num_envs).to(device=device)
 
 env = igenv.NormalizeWrapper(raw_env,
                              obs_shapes=[img_obs.shape[2:],
@@ -321,13 +331,15 @@ start_time = time.time()
 for episode in range(num_episodes):
 
   obs = env.reset(reset_dof_target_tensor, reset_dof_state_tensor, reset_root_body_tensor)
+  num_terms = 0
+  tot_returns = 0
 
   for train_step in range((episode_secs * num_frames_sec) // steps_train):
 
     policyNet.eval()
     with torch.no_grad():
       i = 0
-      while i < steps_train and not gym.query_viewer_has_closed(viewer):
+      while i < steps_train and not check_viewer_closed():
         frame_no = gym.get_frame_count(sim)
         global_step += 1 * num_envs
 
@@ -337,7 +349,7 @@ for episode in range(num_episodes):
         dof_targets, target_logprobs, values = policyNet.get_action_value(cam_tensors, dof_states)  
 
         # step environment
-        next_obs, rewds, last_step = env.step(dof_targets)
+        next_obs, rewds, terms, truncs = env.step(dof_targets)
         print(rewds)
 
         img_obs[i] = cam_tensors
@@ -346,15 +358,21 @@ for episode in range(num_episodes):
         acts_probs[i] = target_logprobs.flatten()
         vals[i] = values.flatten()
         rewards[i] = rewds
-        terms[i] = last_step
+        dones[i] = torch.logical_or(terms, truncs)
 
-        # draw viewer
-        gym.draw_viewer(viewer, sim, True)
-        # wait for dt to elapse in real time
-        gym.sync_frame_time(sim)
+        num_terms += torch.count_nonzero(terms)
+
+        if not args.no_visual:
+          # draw viewer
+          gym.draw_viewer(viewer, sim, True)
+          # wait for dt to elapse in real time
+          gym.sync_frame_time(sim)
 
         i += 1
         obs = next_obs
+
+      if check_viewer_closed():
+        break
 
       # next values for bootstrapping
       cam_tensors, dof_states = obs
@@ -362,7 +380,7 @@ for episode in range(num_episodes):
       vals[i] = values.flatten()
 
       # calculate advantages
-      not_last_step = 1 - terms
+      not_last_step = 1 - dones
       advantages = torch.zeros_like(vals)
       for t in reversed(range(steps_train)):
         delta = rewards[t] + gae_gamma*not_last_step[t]*vals[t+1] - vals[t]
@@ -372,6 +390,9 @@ for episode in range(num_episodes):
       values = vals[:steps_train]
       returns = advantages + values
 
+      tot_returns = returns.mean() + gae_gamma * tot_returns
+
+    # out of torch.no_grad now
     # flatten the batch
     b_img_obs = img_obs.reshape(-1, *img_obs.shape[2:])
     b_dof_obs = dof_obs.reshape(-1, *dof_obs.shape[2:])
@@ -379,16 +400,16 @@ for episode in range(num_episodes):
     b_acts_probs = acts_probs.reshape(-1, *acts_probs.shape[2:])
     b_vals = values.flatten()
     b_returns = returns.flatten()
-    b_terms = terms.flatten()
+    b_dones = dones.flatten()
     b_advantages = advantages.flatten()
 
     policyNet.train()
 
-    b_inds = np.arange(b_terms.numel())
+    b_inds = np.arange(b_dones.numel())
     clipfracs = []
     for epoch in range(epochs):
       np.random.shuffle(b_inds) # in-place
-      for start in range(0, b_terms.numel(), minibatch_size):
+      for start in range(0, b_dones.numel(), minibatch_size):
         end = start + minibatch_size
         mb_inds = b_inds[start:end]
 
@@ -433,11 +454,12 @@ for episode in range(num_episodes):
     print("SPS:", int(global_step / (time.time() - start_time)))
     writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
-    if gym.query_viewer_has_closed(viewer):
-      break
+  writer.add_scalar("progress/num_terms", num_terms.item(), global_step)
+  writer.add_scalar("progress/tot_returns", tot_returns.item(), global_step)
 
-  if gym.query_viewer_has_closed(viewer):
+  if check_viewer_closed():
     break
 
-gym.destroy_viewer(viewer)
+if not args.no_visual:
+  gym.destroy_viewer(viewer)
 gym.destroy_sim(sim)
