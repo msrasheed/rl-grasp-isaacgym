@@ -289,7 +289,7 @@ max_grad_norm = .5
 
 print("num actors", gym.get_sim_actor_count(sim))
 
-env = igenv.IsaacGymEnv(gym, sim, 
+raw_env = igenv.IsaacGymEnv(gym, sim, 
                         franka_num_dofs=franka_num_dofs,
                         target_height=target_height,
                         device=device, 
@@ -310,10 +310,10 @@ vals = torch.zeros(steps_train+1, num_envs).to(device=device)
 rewards = torch.zeros(steps_train, num_envs).to(device=device)
 terms = torch.zeros(steps_train, num_envs).to(device=device)
 
-img_obs_rms = rms.RunningMeanStd(img_obs.shape[2:], device)
-dof_obs_rms = rms.RunningMeanStd(dof_obs.shape[2:], device)
-ret_rms = rms.RunningMeanStd(device=device)
-
+env = igenv.NormalizeWrapper(raw_env,
+                             obs_shapes=[img_obs.shape[2:],
+                                         dof_obs.shape[2:]],
+                             gamma=gae_gamma)
 
 global_step = 0
 start_time = time.time()
@@ -331,22 +331,17 @@ for episode in range(num_episodes):
         frame_no = gym.get_frame_count(sim)
         global_step += 1 * num_envs
 
-        cam_tensors, dof_states_inpol = obs
-
-        img_obs_rms.update(cam_tensors)
-        norm_cam_tensors = img_obs_rms.normalize(cam_tensors)
-        dof_obs_rms.update(dof_state_inpol)
-        norm_dof_states = dof_obs_rms.normalize(dof_state_inpol)
+        cam_tensors, dof_states = obs
 
         # compute action
-        dof_targets, target_logprobs, values = policyNet.get_action_value(norm_cam_tensors, norm_dof_states)  
+        dof_targets, target_logprobs, values = policyNet.get_action_value(cam_tensors, dof_states)  
 
         # step environment
         next_obs, rewds, last_step = env.step(dof_targets)
         print(rewds)
 
-        img_obs[i] = norm_cam_tensors
-        dof_obs[i] = norm_dof_states
+        img_obs[i] = cam_tensors
+        dof_obs[i] = dof_states
         acts[i] = dof_targets
         acts_probs[i] = target_logprobs.flatten()
         vals[i] = values.flatten()
@@ -362,10 +357,8 @@ for episode in range(num_episodes):
         obs = next_obs
 
       # next values for bootstrapping
-      cam_tensors, dof_states_inpol = obs
-      norm_cam_tensors = img_obs_rms.normalize(cam_tensors)
-      norm_dof_states = dof_obs_rms.normalize(dof_state_inpol)
-      _, _, values = policyNet.get_action_value(norm_cam_tensors, norm_dof_states)
+      cam_tensors, dof_states = obs
+      _, _, values = policyNet.get_action_value(cam_tensors, dof_states)
       vals[i] = values.flatten()
 
       # calculate advantages

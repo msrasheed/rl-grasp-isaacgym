@@ -2,6 +2,8 @@ from isaacgym import gymtorch
 
 import torch
 
+import running_mean_std as rms
+
 class IsaacGymEnv:
   def __init__(self, gym, sim, franka_num_dofs, target_height,
                device, env_to_box, env_to_franka, box_rb_idx, hand_rb_idx,
@@ -102,7 +104,7 @@ class IsaacGymEnv:
     cam_tensors[infs_idx] = 0
     self.gym.end_access_image_tensors(self.sim)
 
-    # self.rewards[cam_with_infs] -= 5
+    self.rewards[cam_with_infs] -= 1
     
     return cam_tensors
 
@@ -115,3 +117,37 @@ class IsaacGymEnv:
     self.env_reset |= finished
 
     self.rewards = -(hand_dist + box_height)
+
+  
+class NormalizeWrapper:
+  def __init__(self, env, obs_shapes, gamma, epsilon=1e-8):
+    self.venv = env
+    self.num_envs = env.num_envs
+    self.device = env.device
+    self.ret = torch.zeros(env.num_envs, device=env.device)
+    self.prev_reset = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+
+    self.obs_rms = [rms.RunningMeanStd(shape, self.device, epsilon) for shape in obs_shapes]
+    self.rwd_rms = rms.RunningMeanStd(device=env.device, epsilon=epsilon)
+    self.gamma = gamma
+    
+  def reset(self, dof_target_tensor, dof_state_tensor, root_body_tensor):
+    self.ret = torch.zeros(self.venv.num_envs, device=self.venv.device)
+    obs = self.venv.reset(dof_target_tensor, dof_state_tensor, root_body_tensor)
+    return self._obfilt(obs)
+
+  def _obfilt(self, obs):
+    [r.update(ob) for r, ob in zip(self.obs_rms, obs)]
+    return [r.normalize(ob) for r, ob in zip(self.obs_rms, obs)]
+
+  def step(self, dof_targets):
+    obs, rewds, last_step = self.venv.step(dof_targets)
+    normobs = self._obfilt(obs)
+    self.ret = self.ret * self.gamma + rewds
+    self.rwd_rms.update(self.ret)
+
+    normrwds = self.rwd_rms.normalize_no_center(rewds)
+    # normrwds = rewds
+    self.ret[self.prev_reset] = 0
+    self.prev_reset = last_step
+    return normobs, normrwds, last_step
