@@ -5,13 +5,12 @@ import torch
 import running_mean_std as rms
 
 class IsaacGymEnv:
-  def __init__(self, gym, sim, franka_num_dofs, target_height,
+  def __init__(self, gym, sim, target_height,
                device, env_to_box, env_to_franka, box_rb_idx, hand_rb_idx,
                dof_state_tensor, cam_tensors_arr, rb_states):
     self.gym = gym
     self.sim = sim
     self.num_envs = gym.get_env_count(sim)
-    self.franka_num_dofs = franka_num_dofs
     self.target_height = target_height
     self.device = device
 
@@ -130,13 +129,13 @@ class NormalizeWrapper:
     self.ret = torch.zeros(env.num_envs, device=env.device)
     self.prev_reset = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
 
-    self.obs_rms = [rms.RunningMeanStd(shape, self.device, epsilon) for shape in obs_shapes]
+    self.obs_rms = [rms.RunningMeanStd(shape, env.device, epsilon) for shape in obs_shapes]
     self.rwd_rms = rms.RunningMeanStd(device=env.device, epsilon=epsilon)
     self.gamma = gamma
     
-  def reset(self, dof_target_tensor, dof_state_tensor, root_body_tensor):
+  def reset(self):
     self.ret = torch.zeros(self.venv.num_envs, device=self.venv.device)
-    obs = self.venv.reset(dof_target_tensor, dof_state_tensor, root_body_tensor)
+    obs = self.venv.reset()
     return self._obfilt(obs)
 
   def _obfilt(self, obs):
@@ -165,3 +164,5 @@ class NormalizeWrapper:
       r.mean = torch.load(prefix + f"_mean_{i}.tensor")
       r.var = torch.load(prefix + f"_var_{i}.tensor")
     
+  def __getattr__(self, name):
+    return getattr(self.venv, name)

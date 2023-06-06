@@ -473,12 +473,17 @@ for episode in tqdm.tqdm(range(num_episodes)):
 
     writer.add_scalar("diagnostic/value_mean", b_vals.mean().item(), global_step)
     writer.add_scalar("diagnostic/return_mean", b_returns.mean().item(), global_step)
+    writer.add_scalar("diagnostic/mean_diff", torch.square((b_returns-b_vals)).mean().item(), global_step)
+
 
   writer.add_scalar("progress/num_terms", num_terms.item(), global_step)
   writer.add_scalar("progress/tot_returns", tot_returns.item(), global_step)
 
   if tot_returns.item() > max_return:
     save_actor("max")
+
+  if episode % 100 == 0:
+    save_actor(str(episode))
 
   if check_viewer_closed():
     break
