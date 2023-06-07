@@ -1,25 +1,19 @@
 from isaacgym import gymapi
 from isaacgym import gymutil
-from isaacgym import gymtorch
-from isaacgym import torch_utils
 
 import torch
 import torch.optim as optim
-import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
-import numpy as np
-import tqdm
+import yaml
 
 import os
-import math
-import time
-import signal
+import importlib
+from types import SimpleNamespace
 
-import grasp_policy
 import igenv
-import hand_cam_box_env as hcbe
 import test_train_runner as ttr
 import viewer_wrapper as vw
+import util
 
 
 
@@ -32,7 +26,8 @@ custom_parameters = [
   {"name": "--test", "action": "store_true", "help": "To run in test mode, no training"},
   {"name": "--load", "type": str, "help": "Weights to load"},
   {"name": "--no_visual", "action": "store_true", "help": "Whether to render display or not"},
-  {"name": "--no_writer", "action": "store_true", "help": "Don't log anything to tensorboard"}
+  {"name": "--no_writer", "action": "store_true", "help": "Don't log anything to tensorboard"},
+  {"name": "--config", "type": str, "default": "configs/privileged.yml","help": "Config file to use"}
   ]
 
 args = gymutil.parse_arguments(custom_parameters=custom_parameters)
@@ -108,11 +103,6 @@ else:
 wviewer = vw.IsaacGymViewerWrapper(gym, sim, viewer, args.no_visual)
 
   
-raw_env = hcbe.HandCamBoxEnv(gym, sim, 
-                               num_envs=args.num_envs,
-                               device=device)
-raw_env.create()
-
 run_params = dict(
   episode_secs = 20,
   num_frames_sec = 60
@@ -133,14 +123,32 @@ train_params = dict(
   num_frames_sec = 60
 )
 
+
 assert ((train_params["episode_secs"] * train_params["num_frames_sec"]) \
         % train_params["steps_train"]) == 0, \
         "episode num frames not divisible by num train frames"
 
+with open(args.config, "r") as stream:
+  config_dict = yaml.safe_load(stream)
+  config = SimpleNamespace(**config_dict)
+
+def load_class(class_str):
+  sep_idx = class_str.rfind(".")
+  mod = importlib.import_module(class_str[:sep_idx])
+  return eval("mod." + class_str[(sep_idx+1):])
+
+Env = load_class(config.env)
+Actor = load_class(config.actor)
+
+raw_env = Env(gym, sim, 
+              num_envs=args.num_envs,
+              device=device,
+              no_visual=args.no_visual)
+raw_env.create()
 
 # create policy network
-policyNet = grasp_policy.Policy().to(device=device)
-optimizer = optim.Adam(policyNet.parameters(), lr=3e-4)
+actor = Actor().to(device=device)
+optimizer = optim.Adam(actor.parameters(), lr=3e-4)
 
 
 env = igenv.NormalizeWrapper(raw_env,
@@ -149,36 +157,30 @@ env = igenv.NormalizeWrapper(raw_env,
 
 # tensorboard logger
 if args.no_writer:
-  writer = None
+  writer = util.EmptyCalls()
 else:
-  writer = SummaryWriter()
+  writer = SummaryWriter(log_dir=os.path.join("runs", config.name))
 
 def save_actor(name_prefix):
   path_name = os.path.join(writer.log_dir, name_prefix)
-  torch.save(policyNet.state_dict(), path_name + ".pth")
+  torch.save(actor.state_dict(), path_name + ".pth")
   env.save_obs_tensors(path_name)
 
 def load_actor(name_prefix):
-  policyNet.load_state_dict(torch.load(name_prefix + ".pth"))
+  actor.load_state_dict(torch.load(name_prefix + ".pth"))
   env.load_obs_tensors(name_prefix)
   
-if args.no_visual:
-  def sigint_handler(sig, frame):
-    save_actor("end")
-    gym.destroy_sim(sim)
-    exit()
-  signal.signal(signal.SIGINT, sigint_handler)
 
 if args.load:
   load_actor(args.load)
 
 if args.test:
   runner = ttr.TestRunner(
-    gym, sim, wviewer, env, policyNet, writer, run_params
+    gym, sim, wviewer, env, actor, writer, run_params
   )
 else:
   runner = ttr.TrainRunner(
-    gym, sim, wviewer, env, policyNet, writer,
+    gym, sim, wviewer, env, actor, writer,
     device, train_params, optimizer, save_actor
   )
 

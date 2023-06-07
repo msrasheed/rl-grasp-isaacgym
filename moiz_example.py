@@ -9,7 +9,7 @@ import numpy as np
 
 import math
 
-import grasp_policy
+import rlgrasp.actors.grasp_policy as grasp_policy
 
 
 # get access to gymapi interface
@@ -233,7 +233,8 @@ _dof_states = gym.acquire_dof_state_tensor(sim)
 dof_states = gymtorch.wrap_tensor(_dof_states)
 print("dof_states shape", dof_states.shape)
 dof_state_inpol = dof_states.view(num_envs, franka_num_dofs*2)
-dof_state_reset = dof_states.view(num_envs, franka_num_dofs, 2)
+dof_state_reset = dof_states.view(num_envs, franka_num_dofs, 2).clone()
+
 
 # collect rb tensor for reward calculations later
 _rb_states = gym.acquire_rigid_body_state_tensor(sim)
@@ -255,6 +256,10 @@ terms = torch.zeros(steps_train, num_envs)
 
 print("dof indexes", [gym.get_actor_dof_index(envs[0], frankas[0], i, gymapi.DOMAIN_SIM) for i in range(9)])
 print("num actors", gym.get_sim_actor_count(sim))
+
+lfing_idx = [gym.find_actor_rigid_body_index(e, f, "panda_leftfinger", gymapi.DOMAIN_SIM)
+             for e, f in zip(envs, frankas)]
+print("lfing_idx", lfing_idx)
 
 while not gym.query_viewer_has_closed(viewer):
   frame_no = gym.get_frame_count(sim)
@@ -299,8 +304,11 @@ while not gym.query_viewer_has_closed(viewer):
     # franka_fails_int32 = franka_fails.to(device=device, dtype=torch.int32)
     # gym.set_dof_state_tensor_indexed(sim, gymtorch.unwrap_tensor(new_dof_state), gymtorch.unwrap_tensor(franka_fails_int32), len(franka_fails_int32))
 
-    hand_dist = torch.norm(rb_states[box_rb_index, 0:3]-rb_states[hand_rb_index, 0:3], dim=1)
+    hand_dist = torch.norm(rb_states[box_rb_index, 0:3]-rb_states[lfing_idx, 0:3], dim=1)
     print("dists", hand_dist)
+
+    pose_diff = torch.norm(default_dof_pos_tensor - dof_states[:, 0])
+    print("pose", pose_diff)
 
 
   # draw viewer

@@ -1,0 +1,4 @@
+
+name: hand_cam
+env: envs.hand_cam_box_env.HandCamBoxEnv
+actor: actors.grasp_policy.Policy

@@ -1,0 +1,4 @@
+
+name: privileged_box
+env: envs.privileged_box_env.PrivelegedBoxEnv
+actor: actors.privileged_actor.PrivilegedActor

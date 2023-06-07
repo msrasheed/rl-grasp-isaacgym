@@ -215,10 +215,10 @@ class TrainRunner:
       if tot_returns.item() > max_return:
         self.save_actor("max")
 
-      if episode % 100 == 0:
+      if (episode+1) % 100 == 0:
         self.save_actor(str(episode))
+
+      self.save_actor("latest")
 
       if self.wviewer.check_viewer_closed():
         break
-      
-    self.save_actor("end")

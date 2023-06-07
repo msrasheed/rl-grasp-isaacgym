@@ -9,12 +9,13 @@ import collections
 import util
 
 
-class HandCamBoxEnv:
-  def __init__(self, gym, sim, num_envs, device):
+class PrivelegedBoxEnv:
+  def __init__(self, gym, sim, num_envs, device, no_visual):
     self.gym = gym
     self.sim = sim
     self.num_envs = num_envs
     self.device = device
+    self.no_visual = no_visual
     
     self.first_reset_called = False
 
@@ -22,7 +23,6 @@ class HandCamBoxEnv:
     self.envs = list()
     self.actor_handles = collections.defaultdict(list)
     self.actor_idx = collections.defaultdict(list)
-    self.cam_tensors_arr = list()
 
 
     # Creating Ground Plane
@@ -139,24 +139,6 @@ class HandCamBoxEnv:
       self.actor_idx["box"].append(self.gym.get_actor_index(env, box_handle, gymapi.DOMAIN_SIM))
       init_root_body_pose.append(util.transform_to_rb_tensor(box_pose))
 
-      # add camera
-      camera_props = gymapi.CameraProperties()
-      camera_props.width = 128
-      camera_props.height = 128
-      camera_props.enable_tensors = True
-      camera_handle = self.gym.create_camera_sensor(env, camera_props)
-      self.actor_handles["camera"].append(camera_handle)
-      body_handle = self.gym.find_actor_rigid_body_handle(env, franka_handle, "panda_hand")
-      local_transform = gymapi.Transform()
-      local_transform.p = gymapi.Vec3(.04, 0, 0)
-      local_transform.r = gymapi.Quat.from_axis_angle(gymapi.Vec3(0, 1, 0), np.radians(-90))
-      self.gym.attach_camera_to_body(camera_handle, env, body_handle, local_transform, gymapi.FOLLOW_TRANSFORM)
-
-      # get camera tensor
-      cam_tensor = self.gym.get_camera_image_gpu_tensor(self.sim, env, camera_handle, gymapi.IMAGE_DEPTH)
-      torch_cam_tensor = gymtorch.wrap_tensor(cam_tensor)
-      torch_cam_tensor = torch_cam_tensor.unsqueeze(0)
-      self.cam_tensors_arr.append(torch_cam_tensor)
 
     # prepare internal data structures for tensor API
     self.gym.prepare_sim(self.sim)
@@ -209,7 +191,7 @@ class HandCamBoxEnv:
             for env, actor_handle in zip(self.envs, self.actor_handles[actor_name])]
 
   def get_obs_shape(self):
-    return [[1, 128, 128],
+    return [[7],
             [self.num_dofs * 2]]
 
   def get_action_shape(self):
@@ -227,8 +209,9 @@ class HandCamBoxEnv:
     self.truncs = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
     self.rewards = torch.zeros(self.num_envs, device=self.device)
     self._step()
-    cam_obs = self.get_cam_obs()
-    return (cam_obs, self.dof_states)
+
+    box_obs = self.rb_states[self.box_rb_idx, 0:7]
+    return (box_obs, self.dof_states)
 
 
   def _step(self):
@@ -240,9 +223,8 @@ class HandCamBoxEnv:
     self.gym.refresh_rigid_body_state_tensor(self.sim)
     self.gym.refresh_actor_root_state_tensor(self.sim)
 
-    self.gym.step_graphics(self.sim)
-    # render sensors and refresh camera tensors
-    self.gym.render_all_camera_sensors(self.sim)
+    if not self.no_visual:
+      self.gym.step_graphics(self.sim)
 
 
   def step(self, dof_targets):
@@ -265,37 +247,19 @@ class HandCamBoxEnv:
       self.gym.set_actor_root_state_tensor_indexed(self.sim, gymtorch.unwrap_tensor(self.reset_root_body), gymtorch.unwrap_tensor(ar_int32), len(ar_int32))
 
     self._step()
-    cam_obs = self.get_cam_obs()
-    self.calc_results()
+    self.calc_results(dof_targets)
 
     ret_terms = self.terms
     ret_truncs = self.truncs
     self.terms = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
     self.truncs = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
 
-    return (cam_obs, self.dof_states), self.rewards, ret_terms, ret_truncs
+    box_obs = self.rb_states[self.box_rb_idx, 0:7]
+
+    return (box_obs, self.dof_states), self.rewards, ret_terms, ret_truncs
 
 
-  def start_cam_access(self):
-    self.gym.start_access_image_tensors(self.sim)
-
-  def end_cam_access(self):
-    self.gym.end_access_image_tensors(self.sim)
-
-
-  def get_cam_obs(self):
-    self.gym.start_access_image_tensors(self.sim)
-    cam_tensors = torch.stack(self.cam_tensors_arr)
-    infs_idx = torch.isinf(cam_tensors)
-    cam_with_infs = torch.unique(torch.nonzero(infs_idx)[:, 0])
-    cam_tensors[infs_idx] = 0
-    self.gym.end_access_image_tensors(self.sim)
-
-    self.rewards[cam_with_infs] -= 1
-    
-    return cam_tensors
-
-  def calc_results(self):
+  def calc_results(self, dof_targets):
     lfinger_dist = torch.norm(self.rb_states[self.box_rb_idx, 0:3] \
                            -self.rb_states[self.lfing_rb_idx, 0:3], dim=1)
     rfinger_dist = torch.norm(self.rb_states[self.box_rb_idx, 0:3] \
@@ -303,6 +267,8 @@ class HandCamBoxEnv:
     box_height = self.target_height - self.rb_states[self.box_rb_idx, 2] 
     finished = box_height > self.target_height
 
+    pose_norm = torch.norm(self.reset_dof_target_tensor - dof_targets, dim=1).mean()
+
     self.terms |= finished
 
-    self.rewards = -(lfinger_dist + rfinger_dist + box_height)
+    self.rewards = -(pose_norm + lfinger_dist + rfinger_dist + box_height)

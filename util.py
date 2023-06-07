@@ -12,3 +12,9 @@ def transform_to_rb_tensor(transform):
   rb_tensor[6] = transform.r.w
 
   return rb_tensor
+
+class EmptyCalls:
+  def __getattr__(self, x):
+    def nothing(*args):
+      pass
+    return nothing
