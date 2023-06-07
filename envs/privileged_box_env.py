@@ -169,17 +169,19 @@ class PrivelegedBoxEnv:
 
 
     self.num_dofs = franka_num_dofs
-    self.env_to_dof_actors = self.get_env_to_dof_actor()
-    self.env_to_actors = self.get_env_to_actors()
+    self.env_to_dof_actors = self.get_env_to_actor("franka")
+    self.env_to_actors = self.get_env_to_all_actors()
     self.lfing_rb_idx = self.find_actor_rb_index("franka", "panda_leftfinger")
     self.rfing_rb_idx = self.find_actor_rb_index("franka", "panda_rightfinger")
+    self.hand_rb_idx = self.find_actor_rb_index("franka", "panda_hand")
     self.box_rb_idx = self.get_actor_rb_index("box", 0)
+    self.box_actor_idx = self.get_env_to_actor("box")
 
 
-  def get_env_to_dof_actor(self):
-    return torch.tensor(self.actor_idx["franka"])
+  def get_env_to_actor(self, name):
+    return torch.tensor(self.actor_idx[name])
 
-  def get_env_to_actors(self):
+  def get_env_to_all_actors(self):
     return torch.tensor(list(self.actor_idx.values())).transpose(1, 0)
 
   def find_actor_rb_index(self, actor_name, rb_name, domain=gymapi.DOMAIN_SIM):
@@ -204,6 +206,10 @@ class PrivelegedBoxEnv:
       self.gym.set_dof_state_tensor(self.sim, gymtorch.unwrap_tensor(self.reset_dof_state_tensor))
       self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.reset_root_body_tensor))
     else: self.first_reset_called = True
+
+    self.dist_ckpts = torch.zeros(self.num_envs, device=self.device).fill_(.35)
+    self.z_vec = torch.zeros(self.num_envs, 3, device=self.device)
+    self.z_vec[:, 2].fill_(1.0)
 
     self.terms = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
     self.truncs = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
@@ -260,15 +266,28 @@ class PrivelegedBoxEnv:
 
 
   def calc_results(self, dof_targets):
-    lfinger_dist = torch.norm(self.rb_states[self.box_rb_idx, 0:3] \
-                           -self.rb_states[self.lfing_rb_idx, 0:3], dim=1)
-    rfinger_dist = torch.norm(self.rb_states[self.box_rb_idx, 0:3] \
-                           -self.rb_states[self.rfing_rb_idx, 0:3], dim=1)
-    box_height = self.target_height - self.rb_states[self.box_rb_idx, 2] 
-    finished = box_height > self.target_height
+    # lfinger_dist = torch.norm(self.rb_states[self.box_rb_idx, 0:3] \
+    #                        -self.rb_states[self.lfing_rb_idx, 0:3], dim=1)
+    # rfinger_dist = torch.norm(self.rb_states[self.box_rb_idx, 0:3] \
+    #                        -self.rb_states[self.rfing_rb_idx, 0:3], dim=1)
+    hand_vec = torch_utils.quat_rotate(self.rb_states[self.hand_rb_idx, 3:7], self.z_vec)
+    box_dist = torch.norm(self.rb_states[self.box_rb_idx, 0:3,] \
+                - (self.rb_states[self.hand_rb_idx, 0:3] + hand_vec * .08), dim=1)
+    closer = self.dist_ckpts > box_dist
+    self.dist_ckpts[closer] -= .05
 
-    pose_norm = torch.norm(self.reset_dof_target_tensor - dof_targets, dim=1).mean()
+    finished = self.rb_states[self.box_rb_idx, 2] > self.target_height
+
+    # pose_norm = torch.norm(self.reset_dof_target_tensor - dof_targets, dim=1)
+    rel_box_height =  self.rb_states[self.box_rb_idx, 2] - self.reset_root_body_tensor[self.box_actor_idx, 2]
+    raised = rel_box_height > 0
 
     self.terms |= finished
 
-    self.rewards = -(pose_norm + lfinger_dist + rfinger_dist + box_height)
+    # self.rewards = -(pose_norm + lfinger_dist + rfinger_dist + box_height)
+    self.rewards += (hand_vec[:, 2] + 1) /2
+    # self.rewards = -pose_norm / 100
+    # self.rewards[closer] += .1
+    self.rewards -= box_dist
+    self.rewards[raised] += rel_box_height[raised]
+    self.rewards[finished] += 10

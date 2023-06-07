@@ -9,7 +9,6 @@ import numpy as np
 
 import math
 
-import rlgrasp.actors.grasp_policy as grasp_policy
 
 
 # get access to gymapi interface
@@ -223,9 +222,6 @@ for i in range(num_envs):
 # otherwise get gym cuda error: an illegal memory access was encountered
 gym.prepare_sim(sim)
 
-# create policy network
-policyNet = grasp_policy.Policy().to(device=device)
-policyNet.eval()
 
 # collect dof tensors (frankas dof, other objects don't have dofs)
 franka_actor_idx = torch.tensor(franka_actor_idx)
@@ -304,7 +300,7 @@ while not gym.query_viewer_has_closed(viewer):
     # franka_fails_int32 = franka_fails.to(device=device, dtype=torch.int32)
     # gym.set_dof_state_tensor_indexed(sim, gymtorch.unwrap_tensor(new_dof_state), gymtorch.unwrap_tensor(franka_fails_int32), len(franka_fails_int32))
 
-    hand_dist = torch.norm(rb_states[box_rb_index, 0:3]-rb_states[lfing_idx, 0:3], dim=1)
+    hand_dist = torch.norm(rb_states[box_rb_index, 0:3]-rb_states[hand_rb_index, 0:3], dim=1)
     print("dists", hand_dist)
 
     pose_diff = torch.norm(default_dof_pos_tensor - dof_states[:, 0])

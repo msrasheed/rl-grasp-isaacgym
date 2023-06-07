@@ -9,6 +9,7 @@ import yaml
 import os
 import importlib
 from types import SimpleNamespace
+import datetime
 
 import igenv
 import test_train_runner as ttr
@@ -104,7 +105,7 @@ wviewer = vw.IsaacGymViewerWrapper(gym, sim, viewer, args.no_visual)
 
   
 run_params = dict(
-  episode_secs = 20,
+  episode_secs = 5,
   num_frames_sec = 60
 )
 train_params = dict(
@@ -119,7 +120,7 @@ train_params = dict(
 
   num_episodes = 1000,
   steps_train = 50,
-  episode_secs = 20,
+  episode_secs = 5,
   num_frames_sec = 60
 )
 
@@ -159,7 +160,9 @@ env = igenv.NormalizeWrapper(raw_env,
 if args.no_writer:
   writer = util.EmptyCalls()
 else:
-  writer = SummaryWriter(log_dir=os.path.join("runs", config.name))
+  name_date = datetime.datetime.now().strftime("%b%d_%H-%M-%S")
+  log_dir = os.path.join("runs", config.name, name_date)
+  writer = SummaryWriter(log_dir=log_dir)
 
 def save_actor(name_prefix):
   path_name = os.path.join(writer.log_dir, name_prefix)
